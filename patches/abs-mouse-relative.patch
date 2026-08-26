@@ -1,0 +1,481 @@
+diff --git a/src/config.cpp b/src/config.cpp
+index de3979ee..53c1c8b8 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -861,6 +861,7 @@ namespace config {
+     true,  // always send scancodes
+     true,  // high resolution scrolling
+     true,  // native pen/touch support
++    false,  // absolute mouse as relative (opt-in)
+   };
+ 
+   /**
+@@ -1803,6 +1804,7 @@ namespace config {
+ 
+     bool_f(vars, "high_resolution_scrolling", input.high_resolution_scrolling);
+     bool_f(vars, "native_pen_touch", input.native_pen_touch);
++    bool_f(vars, "absolute_mouse_as_relative", input.absolute_mouse_as_relative);
+ 
+     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
+     bool_f(vars, "system_tray", sunshine.system_tray);
+diff --git a/src/config.h b/src/config.h
+index adc4e842..f92998b7 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -290,6 +290,7 @@ namespace config {
+ 
+     bool high_resolution_scrolling;  ///< Enable high-resolution mouse-wheel events.
+     bool native_pen_touch;  ///< Enable native pen and touch injection.
++    bool absolute_mouse_as_relative;  ///< Emulate absolute client mouse input as relative motion (for compositors whose assistive features only track relative motion).
+   };
+ 
+   namespace flag {
+diff --git a/src/input.cpp b/src/input.cpp
+index bac39561..a8c0b9a1 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -42,6 +42,14 @@ constexpr int WHEEL_DELTA = 120;  ///< Standard Windows wheel delta used to norm
+ 
+ using namespace std::literals;
+ 
++namespace platf {
++  kms_cursor_feedback_t&
++  kms_cursor_feedback() {
++    static kms_cursor_feedback_t fb;
++    return fb;
++  }
++}
++
+ namespace input {
+ 
+   constexpr auto MAX_GAMEPADS = std::min((std::size_t) platf::MAX_GAMEPADS, sizeof(std::int16_t) * 8);  ///< Maximum gamepads representable by the active gamepad mask.
+@@ -271,6 +279,20 @@ namespace input {
+ 
+     input::touch_port_t touch_port;  ///< Touch coordinate bounds for the current stream.
+ 
++    /// State of the absolute->relative mouse conversion (absolute_mouse_as_relative).
++    struct abs_mouse_t {
++      bool initialized = false;  ///< Whether the absolute baseline is set.
++      float frac_x = 0;          ///< Accumulated fractional X delta.
++      float frac_y = 0;          ///< Accumulated fractional Y delta.
++      float host_x = 0;          ///< Dead-reckoning estimate of the host cursor X, touch-port pixels.
++      float host_y = 0;          ///< Dead-reckoning estimate of the host cursor Y, touch-port pixels.
++      std::uint64_t seq_last = 0;  ///< Cursor-feedback sequence seen by the previous event.
++      float last_raw_x = 0;      ///< Previous raw client X (idle detection).
++      float last_raw_y = 0;      ///< Previous raw client Y (idle detection).
++      std::chrono::steady_clock::time_point last_client_move {};  ///< Last time the client coordinates changed.
++    };
++    abs_mouse_t abs_mouse;  ///< Absolute->relative mouse conversion state.
++
+     int32_t accumulated_vscroll_delta;  ///< Accumulated vscroll delta.
+     int32_t accumulated_hscroll_delta;  ///< Accumulated hscroll delta.
+   };
+@@ -778,6 +800,159 @@ namespace input {
+     return {multiply_polar_by_cartesian_scalar(major, angle, scalar), multiply_polar_by_cartesian_scalar(minor, angle + (M_PI / 2), scalar)};
+   }
+ 
++  /// Client mouse event data for the absolute->relative conversion.
++  struct abs_mouse_event_t {
++    std::pair<float, float> tpcoords;  ///< Client coordinates mapped to touch-port pixels.
++    float x;      ///< Raw client X on the client surface.
++    float y;      ///< Raw client Y on the client surface.
++    float width;  ///< Client surface width.
++    float height; ///< Client surface height.
++  };
++
++  /**
++   * @brief Resync the dead-reckoning estimate with the real cursor position.
++   *
++   * The KMS capture path publishes the cursor-plane position once per captured
++   * frame. The feedback is only consumed when trustworthy: while the client is
++   * idle (every in-flight move has landed), or on an axis saturated at the
++   * client's own surface edge (the estimate may be mis-anchored there, and any
++   * feedback lag only overshoots toward the edge, where the compositor clamps).
++   *
++   * @param input The input context.
++   * @param client_idle Whether the client coordinates have been quiet lately.
++   * @param sat_x Whether the X axis is saturated on the client surface.
++   * @param sat_y Whether the Y axis is saturated on the client surface.
++   * @param port_w Touch-port width in pixels.
++   * @param port_h Touch-port height in pixels.
++   */
++  static void
++  abs_mouse_sync_estimate(const std::shared_ptr<input_t> &input, bool client_idle, bool sat_x, bool sat_y, float port_w, float port_h) {
++    const auto &fb = platf::kms_cursor_feedback();
++
++    const auto seq = fb.seq.load();
++    if (seq == 0 || seq == input->abs_mouse.seq_last) {
++      return;
++    }
++    input->abs_mouse.seq_last = seq;
++
++    const auto phys_w = static_cast<float>(fb.desktop_w.load());
++    const auto phys_h = static_cast<float>(fb.desktop_h.load());
++    const auto logical_w = static_cast<float>(fb.logical_w.load());
++    const auto logical_h = static_cast<float>(fb.logical_h.load());
++    if (phys_w <= 0.0f || phys_h <= 0.0f || logical_w <= 0.0f || logical_h <= 0.0f) {
++      return;
++    }
++
++    // Desktop physical pixels -> compositor logical pixels.
++    const auto real_x = static_cast<float>(fb.x.load()) * (logical_w / phys_w);
++    const auto real_y = static_cast<float>(fb.y.load()) * (logical_h / phys_h);
++
++    if (client_idle) {
++      input->abs_mouse.host_x = std::clamp(real_x, 0.0f, port_w - 1.0f);
++      input->abs_mouse.host_y = std::clamp(real_y, 0.0f, port_h - 1.0f);
++      // The fractional residue was relative to the pre-snap estimate; drop it
++      // so the primary loop recomputes a clean delta from the real position.
++      input->abs_mouse.frac_x = 0.0f;
++      input->abs_mouse.frac_y = 0.0f;
++    }
++    else {
++      if (sat_x) {
++        input->abs_mouse.host_x = std::clamp(real_x, 0.0f, port_w - 1.0f);
++        input->abs_mouse.frac_x = 0.0f;
++      }
++      if (sat_y) {
++        input->abs_mouse.host_y = std::clamp(real_y, 0.0f, port_h - 1.0f);
++        input->abs_mouse.frac_y = 0.0f;
++      }
++    }
++  }
++
++  /**
++   * @brief Emulate relative mouse movement from absolute coordinates.
++   *
++   * Absolute motion arrives as PointerMotionAbsolute in the compositor, which
++   * moves the cursor but does NOT update assistive features that only track
++   * relative motion, e.g. the COSMIC screen magnifier focal point
++   * (pop-os/cosmic-comp #2760). The first event anchors the cursor absolutely;
++   * subsequent events are converted to relative deltas.
++   *
++   * Dead reckoning is the only thing in the smooth motion path (1:1, no
++   * latency); the estimate is resynced with the real cursor position while the
++   * client is idle. Phantom "walls" (movement blocked in one direction until
++   * pushed back) come from the client saturating a coordinate in its own
++   * surface while the host cursor sits mid-screen, so a saturated axis simply
++   * targets the matching host edge — the primary loop itself drives the cursor
++   * there, continuously and idempotently.
++   *
++   * @param input The input context.
++   * @param abs_port Absolute-coordinate touch port.
++   * @param event The client mouse event (raw and touch-port coordinates).
++   * @param touch_port_dim_x Touch-port width in pixels.
++   * @param touch_port_dim_y Touch-port height in pixels.
++   */
++  static void
++  abs_mouse_as_relative(const std::shared_ptr<input_t> &input, const platf::touch_port_t &abs_port, const abs_mouse_event_t &event,
++                        int touch_port_dim_x, int touch_port_dim_y) {
++    const auto port_w = static_cast<float>(touch_port_dim_x);
++    const auto port_h = static_cast<float>(touch_port_dim_y);
++
++    const auto &x = event.x;
++    const auto &y = event.y;
++
++    // Saturation bands on the client's own surface.
++    constexpr float kRawEdge = 8.0f;
++    const auto at_left = x <= kRawEdge;
++    const auto at_right = x >= event.width - kRawEdge;
++    const auto at_top = y <= kRawEdge;
++    const auto at_bottom = y >= event.height - kRawEdge;
++
++    // Client target in touch-port units; a saturated axis targets the host edge.
++    auto target_x = std::clamp(event.tpcoords.first, 0.0f, port_w - 1.0f);
++    auto target_y = std::clamp(event.tpcoords.second, 0.0f, port_h - 1.0f);
++    if (at_left) target_x = 0.0f;
++    else if (at_right) target_x = port_w - 1.0f;
++    if (at_top) target_y = 0.0f;
++    else if (at_bottom) target_y = port_h - 1.0f;
++
++    // Idle detection watches the client's own motion (raw coordinates), so a
++    // cursor pinned against its edge still counts as idle once it stops.
++    const auto now = std::chrono::steady_clock::now();
++    if (std::fabs(x - input->abs_mouse.last_raw_x) > 0.01f ||
++        std::fabs(y - input->abs_mouse.last_raw_y) > 0.01f) {
++      input->abs_mouse.last_client_move = now;
++    }
++    input->abs_mouse.last_raw_x = x;
++    input->abs_mouse.last_raw_y = y;
++
++    if (!input->abs_mouse.initialized) {
++      platf::abs_mouse(platf_input, abs_port, event.tpcoords.first, event.tpcoords.second);
++      input->abs_mouse.initialized = true;
++      input->abs_mouse.host_x = target_x;
++      input->abs_mouse.host_y = target_y;
++      return;
++    }
++
++    constexpr auto kIdleMs = std::chrono::milliseconds(150);
++    const auto client_idle = now - input->abs_mouse.last_client_move > kIdleMs;
++    abs_mouse_sync_estimate(input, client_idle, at_left || at_right, at_top || at_bottom, port_w, port_h);
++
++    // Primary loop: drive the estimate toward the (possibly edge-overridden)
++    // target. Idempotent while resting inside the edge band.
++    input->abs_mouse.frac_x += target_x - input->abs_mouse.host_x;
++    input->abs_mouse.frac_y += target_y - input->abs_mouse.host_y;
++
++    const auto delta_x = static_cast<int>(input->abs_mouse.frac_x);
++    const auto delta_y = static_cast<int>(input->abs_mouse.frac_y);
++    input->abs_mouse.frac_x -= delta_x;
++    input->abs_mouse.frac_y -= delta_y;
++
++    if (delta_x || delta_y) {
++      platf::move_mouse(platf_input, delta_x, delta_y);
++      input->abs_mouse.host_x = std::clamp(input->abs_mouse.host_x + delta_x, 0.0f, port_w - 1.0f);
++      input->abs_mouse.host_y = std::clamp(input->abs_mouse.host_y + delta_y, 0.0f, port_h - 1.0f);
++    }
++  }
++
+   /**
+    * @brief Forward a client input packet directly to the platform backend.
+    *
+@@ -831,7 +1006,12 @@ namespace input {
+       touch_port_dim_y
+     };
+ 
+-    platf::abs_mouse(platf_input, abs_port, tpcoords->first, tpcoords->second);
++    if (!config::input.absolute_mouse_as_relative) {
++      platf::abs_mouse(platf_input, abs_port, tpcoords->first, tpcoords->second);
++      return;
++    }
++
++    abs_mouse_as_relative(input, abs_port, { *tpcoords, x, y, width, height }, touch_port_dim_x, touch_port_dim_y);
+   }
+ 
+   /**
+diff --git a/src/platform/common.h b/src/platform/common.h
+index dcb12687..219911f4 100644
+--- a/src/platform/common.h
++++ b/src/platform/common.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ // standard includes
++#include <atomic>
+ #include <bitset>
+ #include <filesystem>
+ #include <functional>
+@@ -74,6 +75,29 @@ namespace nvenc {
+ }
+ 
+ namespace platf {
++  // Real cursor position feedback published by the capture pipeline.
++  // The KMS backend reads the cursor plane position once per captured frame and
++  // publishes it here so the input path can close the loop of the abs->rel
++  // mouse conversion (see config: absolute_mouse_as_relative). Coordinates are
++  // in desktop physical pixels; the logical extents allow rescaling to the
++  // compositor's logical space. seq starts at 0 and is bumped on every update,
++  // so consumers can tell fresh values from stale ones.
++  struct kms_cursor_feedback_t {
++    std::atomic_int32_t x { -1 };
++    std::atomic_int32_t y { -1 };
++    std::atomic_int32_t desktop_w { 0 };  ///< Physical width of the streamed output.
++    std::atomic_int32_t desktop_h { 0 };  ///< Physical height of the streamed output.
++    std::atomic_int32_t logical_w { 0 };  ///< Logical width of the streamed output.
++    std::atomic_int32_t logical_h { 0 };  ///< Logical height of the streamed output.
++    std::atomic_uint64_t seq { 0 };
++  };
++
++  /**
++   * @brief Access the process-wide cursor feedback instance.
++   */
++  kms_cursor_feedback_t&
++  kms_cursor_feedback();
++
+   // Limited by bits in activeGamepadMask
+   constexpr auto MAX_GAMEPADS = 16;  ///< Maximum number of simultaneously tracked gamepads.
+ 
+diff --git a/src/platform/linux/kmsgrab.cpp b/src/platform/linux/kmsgrab.cpp
+index 9575e2c6..ea624e72 100644
+--- a/src/platform/linux/kmsgrab.cpp
++++ b/src/platform/linux/kmsgrab.cpp
+@@ -586,6 +586,26 @@ namespace platf {
+         return std::nullopt;
+       }
+ 
++      /**
++       * @brief Resolve a DRM property ID by name from a props() result.
++       *
++       * Property IDs are stable for the lifetime of a DRM object, so they can be
++       * resolved once and reused on the per-frame path instead of re-fetching
++       * property metadata (drmModeGetProperty) every frame.
++       *
++       * @param props DRM properties and their current values.
++       * @param name Property name to look up.
++       * @return Property ID, or empty when the property doesn't exist.
++       */
++      std::optional<std::uint32_t> prop_id_by_name(const std::vector<std::pair<prop_t, std::uint64_t>> &props, std::string_view name) {
++        for (auto &[prop, val] : props) {
++          if (prop->name == name) {
++            return prop->prop_id;
++          }
++        }
++        return std::nullopt;
++      }
++
+       /**
+        * @brief Get panel orientation.
+        *
+@@ -709,6 +729,33 @@ namespace platf {
+         return props;
+       }
+ 
++      /**
++       * @brief Return raw DRM property IDs and current values in a single ioctl.
++       *
++       * Unlike props(), this avoids a drmModeGetProperty() call per property,
++       * which is only needed to resolve property names. Used on the per-frame
++       * capture path where the property IDs are already cached.
++       *
++       * @param id DRM object ID.
++       * @param type DRM object type.
++       * @return Property IDs and their current values, or empty on failure.
++       */
++      std::vector<std::pair<std::uint32_t, std::uint64_t>> prop_values(std::uint32_t id, std::uint32_t type) {
++        obj_prop_t obj_prop = drmModeObjectGetProperties(fd.el, id, type);
++        if (!obj_prop) {
++          return {};
++        }
++
++        std::vector<std::pair<std::uint32_t, std::uint64_t>> values;
++        values.reserve(obj_prop->count_props);
++
++        for (auto x = 0; x < obj_prop->count_props; ++x) {
++          values.emplace_back(obj_prop->props[x], obj_prop->prop_values[x]);
++        }
++
++        return values;
++      }
++
+       /**
+        * @brief Return DRM plane properties.
+        *
+@@ -1056,6 +1103,7 @@ namespace platf {
+ 
+                 auto connector_props = card.connector_props(*connector_id);
+                 hdr_metadata_blob_id = card.prop_value_by_name(connector_props, "HDR_OUTPUT_METADATA"sv);
++                hdr_metadata_prop_id = card.prop_id_by_name(connector_props, "HDR_OUTPUT_METADATA"sv);
+               }
+             }
+ 
+@@ -1093,6 +1141,17 @@ namespace platf {
+ 
+           BOOST_LOG(info) << "Found cursor plane ["sv << plane->plane_id << ']';
+           cursor_plane_id = plane->plane_id;
++
++          // Resolve cursor property IDs once; values are refreshed per frame.
++          auto cursor_props = card.plane_props(cursor_plane_id);
++          cursor_prop_crtc_x = card.prop_id_by_name(cursor_props, "CRTC_X"sv);
++          cursor_prop_crtc_y = card.prop_id_by_name(cursor_props, "CRTC_Y"sv);
++          cursor_prop_crtc_w = card.prop_id_by_name(cursor_props, "CRTC_W"sv);
++          cursor_prop_crtc_h = card.prop_id_by_name(cursor_props, "CRTC_H"sv);
++          cursor_prop_src_x = card.prop_id_by_name(cursor_props, "SRC_X"sv);
++          cursor_prop_src_y = card.prop_id_by_name(cursor_props, "SRC_Y"sv);
++          cursor_prop_src_w = card.prop_id_by_name(cursor_props, "SRC_W"sv);
++          cursor_prop_src_h = card.prop_id_by_name(cursor_props, "SRC_H"sv);
+           break;
+         }
+ 
+@@ -1209,23 +1268,25 @@ namespace platf {
+         std::optional<std::uint64_t> prop_src_w;
+         std::optional<std::uint64_t> prop_src_h;
+ 
+-        auto props = card.plane_props(cursor_plane_id);
+-        for (auto &[prop, val] : props) {
+-          if (prop->name == "CRTC_X"sv) {
++        // Read current values in a single ioctl, matched by the cached IDs
++        // (property metadata is resolved once at init, not per frame).
++        auto props = card.prop_values(cursor_plane_id, DRM_MODE_OBJECT_PLANE);
++        for (auto &[prop_id, val] : props) {
++          if (cursor_prop_crtc_x && prop_id == *cursor_prop_crtc_x) {
+             prop_crtc_x = val;
+-          } else if (prop->name == "CRTC_Y"sv) {
++          } else if (cursor_prop_crtc_y && prop_id == *cursor_prop_crtc_y) {
+             prop_crtc_y = val;
+-          } else if (prop->name == "CRTC_W"sv) {
++          } else if (cursor_prop_crtc_w && prop_id == *cursor_prop_crtc_w) {
+             prop_crtc_w = val;
+-          } else if (prop->name == "CRTC_H"sv) {
++          } else if (cursor_prop_crtc_h && prop_id == *cursor_prop_crtc_h) {
+             prop_crtc_h = val;
+-          } else if (prop->name == "SRC_X"sv) {
++          } else if (cursor_prop_src_x && prop_id == *cursor_prop_src_x) {
+             prop_src_x = val;
+-          } else if (prop->name == "SRC_Y"sv) {
++          } else if (cursor_prop_src_y && prop_id == *cursor_prop_src_y) {
+             prop_src_y = val;
+-          } else if (prop->name == "SRC_W"sv) {
++          } else if (cursor_prop_src_w && prop_id == *cursor_prop_src_w) {
+             prop_src_w = val;
+-          } else if (prop->name == "SRC_H"sv) {
++          } else if (cursor_prop_src_h && prop_id == *cursor_prop_src_h) {
+             prop_src_h = val;
+           }
+         }
+@@ -1251,6 +1312,20 @@ namespace platf {
+         captured_cursor.dst_w = *prop_crtc_w;
+         captured_cursor.dst_h = *prop_crtc_h;
+ 
++        // Publish the real cursor position for the abs->rel input conversion
++        // (see config: absolute_mouse_as_relative). Cursor-plane CRTC
++        // coordinates are CRTC-local physical pixels; add the output's desktop
++        // offset and publish the output extents so the consumer can rescale
++        // to logical touch-port units.
++        auto &cursor_fb = platf::kms_cursor_feedback();
++        cursor_fb.x.store(offset_x + *prop_crtc_x);
++        cursor_fb.y.store(offset_y + *prop_crtc_y);
++        cursor_fb.desktop_w.store(width);
++        cursor_fb.desktop_h.store(height);
++        cursor_fb.logical_w.store(logical_width);
++        cursor_fb.logical_h.store(logical_height);
++        cursor_fb.seq.fetch_add(1);
++
+         // We're technically cheating a bit here by assuming that we can detect
+         // changes to the cursor plane via property adjustments. If this isn't
+         // true, we'll really have to mmap() the dmabuf and draw that every time.
+@@ -1379,10 +1454,18 @@ namespace platf {
+        * @return Capture status after refreshing framebuffer and cursor state.
+        */
+       inline capture_e refresh(file_t *file, egl::surface_descriptor_t *sd, std::optional<std::chrono::steady_clock::time_point> &frame_timestamp) {
+-        // Check for a change in HDR metadata
+-        if (connector_id) {
+-          auto connector_props = card.connector_props(*connector_id);
+-          if (hdr_metadata_blob_id != card.prop_value_by_name(connector_props, "HDR_OUTPUT_METADATA"sv)) {
++        // Check for a change in HDR metadata using the cached property ID to
++        // avoid re-fetching property metadata on every frame.
++        if (connector_id && hdr_metadata_prop_id) {
++          auto values = card.prop_values(*connector_id, DRM_MODE_OBJECT_CONNECTOR);
++          std::optional<std::uint64_t> hdr_value;
++          for (auto &[prop_id, val] : values) {
++            if (prop_id == *hdr_metadata_prop_id) {
++              hdr_value = val;
++              break;
++            }
++          }
++          if (hdr_value && hdr_metadata_blob_id != hdr_value) {
+             BOOST_LOG(info) << "Reinitializing capture after HDR metadata change"sv;
+             return capture_e::reinit;
+           }
+@@ -1457,10 +1540,21 @@ namespace platf {
+ 
+       std::optional<uint32_t> connector_id;  ///< Connector ID.
+       std::optional<uint64_t> hdr_metadata_blob_id;  ///< HDR metadata blob ID.
++      std::optional<uint32_t> hdr_metadata_prop_id;  ///< Cached "HDR_OUTPUT_METADATA" property ID.
+ 
+       int cursor_plane_id;  ///< Cursor plane ID.
+       cursor_t captured_cursor {};  ///< Captured cursor.
+ 
++      // Cached cursor-plane property IDs (resolved once at init; values change per frame).
++      std::optional<uint32_t> cursor_prop_crtc_x;
++      std::optional<uint32_t> cursor_prop_crtc_y;
++      std::optional<uint32_t> cursor_prop_crtc_w;
++      std::optional<uint32_t> cursor_prop_crtc_h;
++      std::optional<uint32_t> cursor_prop_src_x;
++      std::optional<uint32_t> cursor_prop_src_y;
++      std::optional<uint32_t> cursor_prop_src_w;
++      std::optional<uint32_t> cursor_prop_src_h;
++
+       card_t card;  ///< Card.
+     };
+ 

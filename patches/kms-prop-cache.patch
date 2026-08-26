@@ -1,0 +1,172 @@
+diff --git a/src/platform/linux/kmsgrab.cpp b/src/platform/linux/kmsgrab.cpp
+index 9575e2c..0b768a5 100644
+--- a/src/platform/linux/kmsgrab.cpp
++++ b/src/platform/linux/kmsgrab.cpp
+@@ -586,6 +586,26 @@ namespace platf {
+         return std::nullopt;
+       }
+ 
++      /**
++       * @brief Resolve a DRM property ID by name from a props() result.
++       *
++       * Property IDs are stable for the lifetime of a DRM object, so they can be
++       * resolved once and reused on the per-frame path instead of re-fetching
++       * property metadata (drmModeGetProperty) every frame.
++       *
++       * @param props DRM properties and their current values.
++       * @param name Property name to look up.
++       * @return Property ID, or empty when the property doesn't exist.
++       */
++      std::optional<std::uint32_t> prop_id_by_name(const std::vector<std::pair<prop_t, std::uint64_t>> &props, std::string_view name) {
++        for (auto &[prop, val] : props) {
++          if (prop->name == name) {
++            return prop->prop_id;
++          }
++        }
++        return std::nullopt;
++      }
++
+       /**
+        * @brief Get panel orientation.
+        *
+@@ -709,6 +729,33 @@ namespace platf {
+         return props;
+       }
+ 
++      /**
++       * @brief Return raw DRM property IDs and current values in a single ioctl.
++       *
++       * Unlike props(), this avoids a drmModeGetProperty() call per property,
++       * which is only needed to resolve property names. Used on the per-frame
++       * capture path where the property IDs are already cached.
++       *
++       * @param id DRM object ID.
++       * @param type DRM object type.
++       * @return Property IDs and their current values, or empty on failure.
++       */
++      std::vector<std::pair<std::uint32_t, std::uint64_t>> prop_values(std::uint32_t id, std::uint32_t type) {
++        obj_prop_t obj_prop = drmModeObjectGetProperties(fd.el, id, type);
++        if (!obj_prop) {
++          return {};
++        }
++
++        std::vector<std::pair<std::uint32_t, std::uint64_t>> values;
++        values.reserve(obj_prop->count_props);
++
++        for (auto x = 0; x < obj_prop->count_props; ++x) {
++          values.emplace_back(obj_prop->props[x], obj_prop->prop_values[x]);
++        }
++
++        return values;
++      }
++
+       /**
+        * @brief Return DRM plane properties.
+        *
+@@ -1056,6 +1103,7 @@ namespace platf {
+ 
+                 auto connector_props = card.connector_props(*connector_id);
+                 hdr_metadata_blob_id = card.prop_value_by_name(connector_props, "HDR_OUTPUT_METADATA"sv);
++                hdr_metadata_prop_id = card.prop_id_by_name(connector_props, "HDR_OUTPUT_METADATA"sv);
+               }
+             }
+ 
+@@ -1093,6 +1141,17 @@ namespace platf {
+ 
+           BOOST_LOG(info) << "Found cursor plane ["sv << plane->plane_id << ']';
+           cursor_plane_id = plane->plane_id;
++
++          // Resolve cursor property IDs once; values are refreshed per frame.
++          auto cursor_props = card.plane_props(cursor_plane_id);
++          cursor_prop_crtc_x = card.prop_id_by_name(cursor_props, "CRTC_X"sv);
++          cursor_prop_crtc_y = card.prop_id_by_name(cursor_props, "CRTC_Y"sv);
++          cursor_prop_crtc_w = card.prop_id_by_name(cursor_props, "CRTC_W"sv);
++          cursor_prop_crtc_h = card.prop_id_by_name(cursor_props, "CRTC_H"sv);
++          cursor_prop_src_x = card.prop_id_by_name(cursor_props, "SRC_X"sv);
++          cursor_prop_src_y = card.prop_id_by_name(cursor_props, "SRC_Y"sv);
++          cursor_prop_src_w = card.prop_id_by_name(cursor_props, "SRC_W"sv);
++          cursor_prop_src_h = card.prop_id_by_name(cursor_props, "SRC_H"sv);
+           break;
+         }
+ 
+@@ -1209,23 +1268,25 @@ namespace platf {
+         std::optional<std::uint64_t> prop_src_w;
+         std::optional<std::uint64_t> prop_src_h;
+ 
+-        auto props = card.plane_props(cursor_plane_id);
+-        for (auto &[prop, val] : props) {
+-          if (prop->name == "CRTC_X"sv) {
++        // Read current values in a single ioctl, matched by the cached IDs
++        // (property metadata is resolved once at init, not per frame).
++        auto props = card.prop_values(cursor_plane_id, DRM_MODE_OBJECT_PLANE);
++        for (auto &[prop_id, val] : props) {
++          if (cursor_prop_crtc_x && prop_id == *cursor_prop_crtc_x) {
+             prop_crtc_x = val;
+-          } else if (prop->name == "CRTC_Y"sv) {
++          } else if (cursor_prop_crtc_y && prop_id == *cursor_prop_crtc_y) {
+             prop_crtc_y = val;
+-          } else if (prop->name == "CRTC_W"sv) {
++          } else if (cursor_prop_crtc_w && prop_id == *cursor_prop_crtc_w) {
+             prop_crtc_w = val;
+-          } else if (prop->name == "CRTC_H"sv) {
++          } else if (cursor_prop_crtc_h && prop_id == *cursor_prop_crtc_h) {
+             prop_crtc_h = val;
+-          } else if (prop->name == "SRC_X"sv) {
++          } else if (cursor_prop_src_x && prop_id == *cursor_prop_src_x) {
+             prop_src_x = val;
+-          } else if (prop->name == "SRC_Y"sv) {
++          } else if (cursor_prop_src_y && prop_id == *cursor_prop_src_y) {
+             prop_src_y = val;
+-          } else if (prop->name == "SRC_W"sv) {
++          } else if (cursor_prop_src_w && prop_id == *cursor_prop_src_w) {
+             prop_src_w = val;
+-          } else if (prop->name == "SRC_H"sv) {
++          } else if (cursor_prop_src_h && prop_id == *cursor_prop_src_h) {
+             prop_src_h = val;
+           }
+         }
+@@ -1379,10 +1440,18 @@ namespace platf {
+        * @return Capture status after refreshing framebuffer and cursor state.
+        */
+       inline capture_e refresh(file_t *file, egl::surface_descriptor_t *sd, std::optional<std::chrono::steady_clock::time_point> &frame_timestamp) {
+-        // Check for a change in HDR metadata
+-        if (connector_id) {
+-          auto connector_props = card.connector_props(*connector_id);
+-          if (hdr_metadata_blob_id != card.prop_value_by_name(connector_props, "HDR_OUTPUT_METADATA"sv)) {
++        // Check for a change in HDR metadata using the cached property ID to
++        // avoid re-fetching property metadata on every frame.
++        if (connector_id && hdr_metadata_prop_id) {
++          auto values = card.prop_values(*connector_id, DRM_MODE_OBJECT_CONNECTOR);
++          std::optional<std::uint64_t> hdr_value;
++          for (auto &[prop_id, val] : values) {
++            if (prop_id == *hdr_metadata_prop_id) {
++              hdr_value = val;
++              break;
++            }
++          }
++          if (hdr_value && hdr_metadata_blob_id != hdr_value) {
+             BOOST_LOG(info) << "Reinitializing capture after HDR metadata change"sv;
+             return capture_e::reinit;
+           }
+@@ -1457,10 +1526,21 @@ namespace platf {
+ 
+       std::optional<uint32_t> connector_id;  ///< Connector ID.
+       std::optional<uint64_t> hdr_metadata_blob_id;  ///< HDR metadata blob ID.
++      std::optional<uint32_t> hdr_metadata_prop_id;  ///< Cached "HDR_OUTPUT_METADATA" property ID.
+ 
+       int cursor_plane_id;  ///< Cursor plane ID.
+       cursor_t captured_cursor {};  ///< Captured cursor.
+ 
++      // Cached cursor-plane property IDs (resolved once at init; values change per frame).
++      std::optional<uint32_t> cursor_prop_crtc_x;
++      std::optional<uint32_t> cursor_prop_crtc_y;
++      std::optional<uint32_t> cursor_prop_crtc_w;
++      std::optional<uint32_t> cursor_prop_crtc_h;
++      std::optional<uint32_t> cursor_prop_src_x;
++      std::optional<uint32_t> cursor_prop_src_y;
++      std::optional<uint32_t> cursor_prop_src_w;
++      std::optional<uint32_t> cursor_prop_src_h;
++
+       card_t card;  ///< Card.
+     };
+ 

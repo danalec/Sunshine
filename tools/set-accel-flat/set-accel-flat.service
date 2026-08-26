@@ -1,0 +1,12 @@
+[Unit]
+Description=Set FLAT (1:1) pointer acceleration on the Sunshine virtual mouse
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/danalec/bin/set-accel-flat
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
