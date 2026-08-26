@@ -1269,11 +1269,15 @@ namespace egl {
     // When only a sub-part of the image must be encoded...
     const bool copy = offset_x || offset_y || img.sd.width != in_width || img.sd.height != in_height;
     if (copy) {
-      auto framebuf = gl::frame_buf_t::make(1);
-      framebuf.bind(&texture, &texture + 1);
+      // Reuse the persistent copy framebuffer instead of creating one per frame.
+      // The color attachment is re-bound on every call in case the source texture changed.
+      if (!copy_framebuffer.size()) {
+        copy_framebuffer = gl::frame_buf_t::make(1);
+      }
+      copy_framebuffer.bind(&texture, &texture + 1);
 
       loaded_texture = tex[0];
-      framebuf.copy(0, loaded_texture, offset_x, offset_y, in_width, in_height);
+      copy_framebuffer.copy(0, loaded_texture, offset_x, offset_y, in_width, in_height);
     } else {
       loaded_texture = texture;
     }
