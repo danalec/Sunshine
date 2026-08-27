@@ -1318,13 +1318,13 @@ namespace platf {
         // offset and publish the output extents so the consumer can rescale
         // to logical touch-port units.
         auto &cursor_fb = platf::kms_cursor_feedback();
-        cursor_fb.x.store(offset_x + *prop_crtc_x);
-        cursor_fb.y.store(offset_y + *prop_crtc_y);
-        cursor_fb.desktop_w.store(width);
-        cursor_fb.desktop_h.store(height);
-        cursor_fb.logical_w.store(logical_width);
-        cursor_fb.logical_h.store(logical_height);
-        cursor_fb.seq.fetch_add(1);
+        cursor_fb.x.store(offset_x + *prop_crtc_x, std::memory_order_relaxed);
+        cursor_fb.y.store(offset_y + *prop_crtc_y, std::memory_order_relaxed);
+        cursor_fb.desktop_w.store(width, std::memory_order_relaxed);
+        cursor_fb.desktop_h.store(height, std::memory_order_relaxed);
+        cursor_fb.logical_w.store(logical_width, std::memory_order_relaxed);
+        cursor_fb.logical_h.store(logical_height, std::memory_order_relaxed);
+        cursor_fb.seq.fetch_add(1, std::memory_order_release);
 
         // We're technically cheating a bit here by assuming that we can detect
         // changes to the cursor plane via property adjustments. If this isn't

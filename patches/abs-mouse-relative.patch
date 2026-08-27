@@ -31,7 +31,7 @@ index adc4e8421..f92998b7c 100644
  
    namespace flag {
 diff --git a/src/input.cpp b/src/input.cpp
-index bac395614..a8c0b9a1d 100644
+index bac395614..5ccaa91d5 100644
 --- a/src/input.cpp
 +++ b/src/input.cpp
 @@ -42,6 +42,14 @@ constexpr int WHEEL_DELTA = 120;  ///< Standard Windows wheel delta used to norm
@@ -70,7 +70,7 @@ index bac395614..a8c0b9a1d 100644
      int32_t accumulated_vscroll_delta;  ///< Accumulated vscroll delta.
      int32_t accumulated_hscroll_delta;  ///< Accumulated hscroll delta.
    };
-@@ -778,6 +800,159 @@ namespace input {
+@@ -778,6 +800,162 @@ namespace input {
      return {multiply_polar_by_cartesian_scalar(major, angle, scalar), multiply_polar_by_cartesian_scalar(minor, angle + (M_PI / 2), scalar)};
    }
  
@@ -103,23 +103,26 @@ index bac395614..a8c0b9a1d 100644
 +  abs_mouse_sync_estimate(const std::shared_ptr<input_t> &input, bool client_idle, bool sat_x, bool sat_y, float port_w, float port_h) {
 +    const auto &fb = platf::kms_cursor_feedback();
 +
-+    const auto seq = fb.seq.load();
++    // Acquire pairs with the producer's release bump on `seq`; the field
++    // loads below are relaxed because they are only meaningful for the
++    // snapshot tagged by a changed `seq` (see kms_cursor_feedback_t).
++    const auto seq = fb.seq.load(std::memory_order_acquire);
 +    if (seq == 0 || seq == input->abs_mouse.seq_last) {
 +      return;
 +    }
 +    input->abs_mouse.seq_last = seq;
 +
-+    const auto phys_w = static_cast<float>(fb.desktop_w.load());
-+    const auto phys_h = static_cast<float>(fb.desktop_h.load());
-+    const auto logical_w = static_cast<float>(fb.logical_w.load());
-+    const auto logical_h = static_cast<float>(fb.logical_h.load());
++    const auto phys_w = static_cast<float>(fb.desktop_w.load(std::memory_order_relaxed));
++    const auto phys_h = static_cast<float>(fb.desktop_h.load(std::memory_order_relaxed));
++    const auto logical_w = static_cast<float>(fb.logical_w.load(std::memory_order_relaxed));
++    const auto logical_h = static_cast<float>(fb.logical_h.load(std::memory_order_relaxed));
 +    if (phys_w <= 0.0f || phys_h <= 0.0f || logical_w <= 0.0f || logical_h <= 0.0f) {
 +      return;
 +    }
 +
 +    // Desktop physical pixels -> compositor logical pixels.
-+    const auto real_x = static_cast<float>(fb.x.load()) * (logical_w / phys_w);
-+    const auto real_y = static_cast<float>(fb.y.load()) * (logical_h / phys_h);
++    const auto real_x = static_cast<float>(fb.x.load(std::memory_order_relaxed)) * (logical_w / phys_w);
++    const auto real_y = static_cast<float>(fb.y.load(std::memory_order_relaxed)) * (logical_h / phys_h);
 +
 +    if (client_idle) {
 +      input->abs_mouse.host_x = std::clamp(real_x, 0.0f, port_w - 1.0f);
@@ -230,7 +233,7 @@ index bac395614..a8c0b9a1d 100644
    /**
     * @brief Forward a client input packet directly to the platform backend.
     *
-@@ -831,7 +1006,12 @@ namespace input {
+@@ -831,7 +1009,12 @@ namespace input {
        touch_port_dim_y
      };
  
@@ -245,7 +248,7 @@ index bac395614..a8c0b9a1d 100644
  
    /**
 diff --git a/src/platform/common.h b/src/platform/common.h
-index dcb126878..219911f4f 100644
+index dcb126878..ddac62557 100644
 --- a/src/platform/common.h
 +++ b/src/platform/common.h
 @@ -5,6 +5,7 @@
@@ -256,7 +259,7 @@ index dcb126878..219911f4f 100644
  #include <bitset>
  #include <filesystem>
  #include <functional>
-@@ -74,6 +75,29 @@ namespace nvenc {
+@@ -74,6 +75,35 @@ namespace nvenc {
  }
  
  namespace platf {
@@ -267,6 +270,12 @@ index dcb126878..219911f4f 100644
 +  // in desktop physical pixels; the logical extents allow rescaling to the
 +  // compositor's logical space. seq starts at 0 and is bumped on every update,
 +  // so consumers can tell fresh values from stale ones.
++  //
++  // Dirty-flag pattern: the producer stores the fields with relaxed ordering
++  // and bumps `seq` with release; the consumer loads `seq` with acquire and
++  // reads the fields relaxed. The acquire on a changed `seq` guarantees the
++  // relaxed field loads observe the stores that happened-before the release
++  // bump, so no per-field seq_cst barriers are needed.
 +  struct kms_cursor_feedback_t {
 +    std::atomic_int32_t x { -1 };
 +    std::atomic_int32_t y { -1 };
@@ -274,7 +283,7 @@ index dcb126878..219911f4f 100644
 +    std::atomic_int32_t desktop_h { 0 };  ///< Physical height of the streamed output.
 +    std::atomic_int32_t logical_w { 0 };  ///< Logical width of the streamed output.
 +    std::atomic_int32_t logical_h { 0 };  ///< Logical height of the streamed output.
-+    std::atomic_uint64_t seq { 0 };
++    std::atomic_uint64_t seq { 0 };  ///< Monotonic dirty counter (release on write, acquire on read).
 +  };
 +
 +  /**

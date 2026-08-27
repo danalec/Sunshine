@@ -82,6 +82,12 @@ namespace platf {
   // in desktop physical pixels; the logical extents allow rescaling to the
   // compositor's logical space. seq starts at 0 and is bumped on every update,
   // so consumers can tell fresh values from stale ones.
+  //
+  // Dirty-flag pattern: the producer stores the fields with relaxed ordering
+  // and bumps `seq` with release; the consumer loads `seq` with acquire and
+  // reads the fields relaxed. The acquire on a changed `seq` guarantees the
+  // relaxed field loads observe the stores that happened-before the release
+  // bump, so no per-field seq_cst barriers are needed.
   struct kms_cursor_feedback_t {
     std::atomic_int32_t x { -1 };
     std::atomic_int32_t y { -1 };
@@ -89,7 +95,7 @@ namespace platf {
     std::atomic_int32_t desktop_h { 0 };  ///< Physical height of the streamed output.
     std::atomic_int32_t logical_w { 0 };  ///< Logical width of the streamed output.
     std::atomic_int32_t logical_h { 0 };  ///< Logical height of the streamed output.
-    std::atomic_uint64_t seq { 0 };
+    std::atomic_uint64_t seq { 0 };  ///< Monotonic dirty counter (release on write, acquire on read).
   };
 
   /**
