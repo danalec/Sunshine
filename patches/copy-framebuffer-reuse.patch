@@ -1,5 +1,5 @@
 diff --git a/src/platform/linux/graphics.cpp b/src/platform/linux/graphics.cpp
-index 1ef27c71..ec702669 100644
+index 1ef27c7..ec70266 100644
 --- a/src/platform/linux/graphics.cpp
 +++ b/src/platform/linux/graphics.cpp
 @@ -1269,11 +1269,15 @@ namespace egl {
