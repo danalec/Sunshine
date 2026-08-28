@@ -829,26 +829,43 @@ namespace input {
   abs_mouse_sync_estimate(const std::shared_ptr<input_t> &input, bool client_idle, bool sat_x, bool sat_y, float port_w, float port_h) {
     const auto &fb = platf::kms_cursor_feedback();
 
-    // Acquire pairs with the producer's release bump on `seq`; the field
-    // loads below are relaxed because they are only meaningful for the
-    // snapshot tagged by a changed `seq` (see kms_cursor_feedback_t).
-    const auto seq = fb.seq.load(std::memory_order_acquire);
+    // Seqlock read: retry while the writer is mid-update, and validate the
+    // sequence is unchanged after snapshotting the fields.
+    std::uint64_t seq;
+    std::int32_t cursor_x;
+    std::int32_t cursor_y;
+    std::int32_t phys_w;
+    std::int32_t phys_h;
+    std::int32_t logical_w;
+    std::int32_t logical_h;
+    for (;;) {
+      seq = fb.seq.load();
+      if (seq & 1) {
+        continue;
+      }
+      cursor_x = fb.x.load();
+      cursor_y = fb.y.load();
+      phys_w = fb.desktop_w.load();
+      phys_h = fb.desktop_h.load();
+      logical_w = fb.logical_w.load();
+      logical_h = fb.logical_h.load();
+      if (seq == fb.seq.load()) {
+        break;
+      }
+    }
+
     if (seq == 0 || seq == input->abs_mouse.seq_last) {
       return;
     }
     input->abs_mouse.seq_last = seq;
 
-    const auto phys_w = static_cast<float>(fb.desktop_w.load(std::memory_order_relaxed));
-    const auto phys_h = static_cast<float>(fb.desktop_h.load(std::memory_order_relaxed));
-    const auto logical_w = static_cast<float>(fb.logical_w.load(std::memory_order_relaxed));
-    const auto logical_h = static_cast<float>(fb.logical_h.load(std::memory_order_relaxed));
-    if (phys_w <= 0.0f || phys_h <= 0.0f || logical_w <= 0.0f || logical_h <= 0.0f) {
+    if (phys_w <= 0 || phys_h <= 0 || logical_w <= 0 || logical_h <= 0) {
       return;
     }
 
-    // Desktop physical pixels -> compositor logical pixels.
-    const auto real_x = static_cast<float>(fb.x.load(std::memory_order_relaxed)) * (logical_w / phys_w);
-    const auto real_y = static_cast<float>(fb.y.load(std::memory_order_relaxed)) * (logical_h / phys_h);
+    // Output-local physical pixels -> compositor logical pixels.
+    const auto real_x = static_cast<float>(cursor_x) * (static_cast<float>(logical_w) / static_cast<float>(phys_w));
+    const auto real_y = static_cast<float>(cursor_y) * (static_cast<float>(logical_h) / static_cast<float>(phys_h));
 
     if (client_idle) {
       input->abs_mouse.host_x = std::clamp(real_x, 0.0f, port_w - 1.0f);
